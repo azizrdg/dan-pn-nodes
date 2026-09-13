@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package xray.app.stats.command;
+option go_package = "github.com/xtls/xray-core/app/stats/command";
+
+message GetStatsRequest {
+  string name = 1;
+  bool reset = 2;
+}
+
+message Stat {
+  string name = 1;
+  int64 value = 2;
+}
+
+message GetStatsResponse {
+  Stat stat = 1;
+}
+
+message SysStatsResponse {
+  uint32 num_goroutine = 1;
+  uint32 num_gc = 2;
+  uint64 alloc = 3;
+  uint64 total_alloc = 4;
+  uint64 sys = 5;
+  uint64 mallocs = 6;
+  uint64 frees = 7;
+  uint64 live_objects = 8;
+  uint64 num_cpu = 9;
+}
+
+service StatsService {
+  rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
+  rpc GetSysStats(GetStatsRequest) returns (SysStatsResponse) {}
+}

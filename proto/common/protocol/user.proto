@@ -1,0 +1,12 @@
+syntax = "proto3";
+
+package xray.common.protocol;
+option go_package = "github.com/xtls/xray-core/common/protocol";
+
+import "google/protobuf/any.proto";
+
+message User {
+  uint32 level = 1;
+  string email = 2;
+  google.protobuf.Any account = 3;
+}

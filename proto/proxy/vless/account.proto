@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package xray.proxy.vless;
+option go_package = "github.com/xtls/xray-core/proxy/vless";
+
+message Account {
+  string id = 1;
+  string flow = 3;
+  string encryption = 4;
+}

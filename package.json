@@ -1,0 +1,23 @@
+{
+  "name": "node-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Thin REST wrapper over Xray-core for a single VPN node",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "@grpc/grpc-js": "^1.10.9",
+    "@grpc/proto-loader": "^0.7.13",
+    "better-sqlite3": "^11.3.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "protobufjs": "^7.4.0",
+    "uuid": "^9.0.1"
+  }
+}
