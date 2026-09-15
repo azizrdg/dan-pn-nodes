@@ -12,6 +12,21 @@ const PROTO_FILES = [
   "app/stats/command/command.proto",
 ];
 
+// Отдельный список для protobufjs (_packAny/getPbRoot): помимо файлов,
+// которые нужны gRPC-сервисам (HandlerService/StatsService) через
+// proto-loader выше, сюда обязательно нужно включать ЛЮБОЙ .proto,
+// чьи типы паковаются вручную через _packAny() — в частности
+// account.proto с xray.proxy.vless.Account, который нигде не
+// импортируется из command.proto/user.proto (там google.protobuf.Any
+// стоит как заглушка, реальный тип protobufjs должен знать сам).
+// Раньше этого файла тут не было — root.lookupType("xray.proxy.vless.Account")
+// падал с "no such type: xray.proxy.vless.Account", даже когда
+// ENOENT на common/protocol/user.proto уже был исправлен.
+const PBJS_PROTO_FILES = [
+  ...PROTO_FILES,
+  "proxy/vless/account.proto",
+];
+
 const packageDefinition = protoLoader.loadSync(PROTO_FILES, {
   keepCase: false,
   longs: String,
@@ -24,10 +39,8 @@ const packageDefinition = protoLoader.loadSync(PROTO_FILES, {
 const proto = grpc.loadPackageDefinition(packageDefinition);
 
 // protobufjs используется отдельно, чтобы вручную закодировать
-// AddUserOperation/RemoveUserOperation в google.protobuf.Any,
+// AddUserOperation/RemoveUserOperation/Account в google.protobuf.Any,
 // так как proto-loader не паковает Any сам по себе.
-// src/xrayGrpc.js
-
 let pbRoot = null;
 async function getPbRoot() {
   if (pbRoot) return pbRoot;
@@ -41,7 +54,7 @@ async function getPbRoot() {
     return path.join(PROTO_ROOT, target);
   };
 
-  pbRoot = await root.load(PROTO_FILES.map((f) => path.join(PROTO_ROOT, f)));
+  pbRoot = await root.load(PBJS_PROTO_FILES.map((f) => path.join(PROTO_ROOT, f)));
   return pbRoot;
 }
 
