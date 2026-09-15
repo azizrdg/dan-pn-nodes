@@ -26,12 +26,22 @@ const proto = grpc.loadPackageDefinition(packageDefinition);
 // protobufjs используется отдельно, чтобы вручную закодировать
 // AddUserOperation/RemoveUserOperation в google.protobuf.Any,
 // так как proto-loader не паковает Any сам по себе.
+// src/xrayGrpc.js
+
 let pbRoot = null;
 async function getPbRoot() {
   if (pbRoot) return pbRoot;
-  pbRoot = await protobuf.load(
-    PROTO_FILES.map((f) => path.join(PROTO_ROOT, f))
-  );
+
+  const root = new protobuf.Root();
+  // Резолвим все относительные импорты (import "common/protocol/user.proto";)
+  // от PROTO_ROOT, а не от директории импортирующего файла — так же,
+  // как это делает includeDirs у @grpc/proto-loader выше.
+  root.resolvePath = (origin, target) => {
+    if (path.isAbsolute(target)) return target;
+    return path.join(PROTO_ROOT, target);
+  };
+
+  pbRoot = await root.load(PROTO_FILES.map((f) => path.join(PROTO_ROOT, f)));
   return pbRoot;
 }
 
