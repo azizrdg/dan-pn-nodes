@@ -17,6 +17,8 @@ message GetStatsResponse {
   Stat stat = 1;
 }
 
+message SysStatsRequest {}
+
 message SysStatsResponse {
   uint32 num_goroutine = 1;
   uint32 num_gc = 2;
@@ -31,5 +33,5 @@ message SysStatsResponse {
 
 service StatsService {
   rpc GetStats(GetStatsRequest) returns (GetStatsResponse) {}
-  rpc GetSysStats(GetStatsRequest) returns (SysStatsResponse) {}
+  rpc GetSysStats(SysStatsRequest) returns (SysStatsResponse) {}
 }
