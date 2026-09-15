@@ -12,19 +12,19 @@ const PROTO_FILES = [
   "app/stats/command/command.proto",
 ];
 
-// Отдельный список для protobufjs (_packAny/getPbRoot): помимо файлов,
+// Отдельный список для protobufjs (_packTypedMessage/getPbRoot): помимо файлов,
 // которые нужны gRPC-сервисам (HandlerService/StatsService) через
 // proto-loader выше, сюда обязательно нужно включать ЛЮБОЙ .proto,
-// чьи типы паковаются вручную через _packAny() — в частности
+// чьи типы паковаются вручную через _packTypedMessage() — в частности
 // account.proto с xray.proxy.vless.Account, который нигде не
-// импортируется из command.proto/user.proto (там google.protobuf.Any
-// стоит как заглушка, реальный тип protobufjs должен знать сам).
-// Раньше этого файла тут не было — root.lookupType("xray.proxy.vless.Account")
-// падал с "no such type: xray.proxy.vless.Account", даже когда
-// ENOENT на common/protocol/user.proto уже был исправлен.
+// импортируется из command.proto/user.proto (там TypedMessage стоит
+// как заглушка, реальный тип protobufjs должен знать сам), и сам
+// typed_message.proto (иначе root.lookupType("xray.common.serial.TypedMessage")
+// падал бы с "no such type").
 const PBJS_PROTO_FILES = [
   ...PROTO_FILES,
   "proxy/vless/account.proto",
+  "common/serial/typed_message.proto",
 ];
 
 const packageDefinition = protoLoader.loadSync(PROTO_FILES, {
@@ -39,8 +39,8 @@ const packageDefinition = protoLoader.loadSync(PROTO_FILES, {
 const proto = grpc.loadPackageDefinition(packageDefinition);
 
 // protobufjs используется отдельно, чтобы вручную закодировать
-// AddUserOperation/RemoveUserOperation/Account в google.protobuf.Any,
-// так как proto-loader не паковает Any сам по себе.
+// AddUserOperation/RemoveUserOperation/Account в xray.common.serial.TypedMessage,
+// так как proto-loader не паковает TypedMessage сам по себе.
 let pbRoot = null;
 async function getPbRoot() {
   if (pbRoot) return pbRoot;
@@ -81,7 +81,17 @@ class XrayGrpcClient {
     });
   }
 
-  async _packAny(typeName, payload) {
+  /**
+   * Паковка в xray.common.serial.TypedMessage — это НЕ google.protobuf.Any,
+   * хотя wire-формат совпадает (оба поля: 1=string, 2=bytes). Ключевое
+   * отличие: значение поля "type" должно быть ГОЛЫМ полным именем типа
+   * (например "xray.app.proxyman.command.AddUserOperation"), БЕЗ префикса
+   * "type.googleapis.com/" — именно так xray-core через proto.MessageType()
+   * ищет зарегистрированный Go-тип. Префикс "type.googleapis.com/" приводил
+   * к ошибке "unknown operation > proto: not found", хотя байты на проводе
+   * были синтаксически валидны.
+   */
+  async _packTypedMessage(typeName, payload) {
     const root = await getPbRoot();
     const MsgType = root.lookupType(typeName);
     const errMsg = MsgType.verify(payload);
@@ -89,7 +99,7 @@ class XrayGrpcClient {
     const message = MsgType.create(payload);
     const bytes = MsgType.encode(message).finish();
     return {
-      type_url: `type.googleapis.com/${typeName}`,
+      type: typeName,
       value: Buffer.from(bytes),
     };
   }
@@ -99,7 +109,7 @@ class XrayGrpcClient {
    * HandlerService.AlterInbound + AddUserOperation.
    */
   async addVlessUser({ tag, email, uuid, flow }) {
-    const account = await this._packAny("xray.proxy.vless.Account", {
+    const account = await this._packTypedMessage("xray.proxy.vless.Account", {
       id: uuid,
       flow: flow || "xtls-rprx-vision",
       encryption: "none",
@@ -107,7 +117,7 @@ class XrayGrpcClient {
 
     const user = { level: 0, email, account };
 
-    const operation = await this._packAny(
+    const operation = await this._packTypedMessage(
       "xray.app.proxyman.command.AddUserOperation",
       { user }
     );
@@ -116,7 +126,7 @@ class XrayGrpcClient {
   }
 
   async removeUser({ tag, email }) {
-    const operation = await this._packAny(
+    const operation = await this._packTypedMessage(
       "xray.app.proxyman.command.RemoveUserOperation",
       { email }
     );

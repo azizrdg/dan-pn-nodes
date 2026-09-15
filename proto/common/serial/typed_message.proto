@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+package xray.common.serial;
+option go_package = "github.com/xtls/xray-core/common/serial";
+
+// Xray-core НЕ использует google.protobuf.Any для полиморфных полей
+// (AlterInboundRequest.operation, User.account и т.п.), а использует
+// собственный TypedMessage: { type: string, value: bytes }. На проводе
+// он wire-совместим с Any (оба поля: 1=string, 2=bytes), поэтому
+// сериализация "проходила", но xray-core не находил тип, потому что
+// искал точное имя вида "xray.app.proxyman.command.AddUserOperation",
+// а мы присылали "type.googleapis.com/xray.app.proxyman.command.AddUserOperation".
+message TypedMessage {
+  string type = 1;
+  bytes value = 2;
+}

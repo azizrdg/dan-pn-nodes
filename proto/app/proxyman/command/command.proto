@@ -3,7 +3,7 @@ syntax = "proto3";
 package xray.app.proxyman.command;
 option go_package = "github.com/xtls/xray-core/app/proxyman/command";
 
-import "google/protobuf/any.proto";
+import "common/serial/typed_message.proto";
 import "common/protocol/user.proto";
 
 message AddUserOperation {
@@ -16,7 +16,7 @@ message RemoveUserOperation {
 
 message AlterInboundRequest {
   string tag = 1;
-  google.protobuf.Any operation = 2;
+  xray.common.serial.TypedMessage operation = 2;
 }
 
 message AlterInboundResponse {}
