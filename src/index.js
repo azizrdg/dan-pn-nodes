@@ -8,8 +8,8 @@ const { v4: uuidv4 } = require("uuid");
 const logger = require("./logger");
 const db = require("./db");
 const { XrayGrpcClient } = require("./xrayGrpc");
-const { XrayConfigFileManager } = require("./xrayConfigFile");
 const { buildVlessLink, buildHysteria2Link } = require("./linkBuilder");
+const { startHysteriaTrafficPoller } = require("./hysteriaTrafficPoller");
 
 const {
   PORT = "8443",
@@ -21,10 +21,11 @@ const {
   VLESS_PORT = "443",
   HYSTERIA2_PORT = "8443",
   PUBLIC_HOST,
-  XRAY_CONFIG_PATH = "/usr/local/etc/xray/config.json",
   HYSTERIA2_INSECURE = "1",
   VLESS_INBOUND_TAG = "vless-reality-in",
-  HYSTERIA2_INBOUND_TAG = "hysteria2-in",
+  HYSTERIA_TRAFFIC_STATS_URL,
+  HYSTERIA_TRAFFIC_STATS_SECRET,
+  HYSTERIA_TRAFFIC_POLL_INTERVAL_MS = "30000",
 } = process.env;
 
 if (!NODE_API_SECRET) {
@@ -37,19 +38,22 @@ if (!PUBLIC_HOST) {
 }
 
 const grpcClient = new XrayGrpcClient(XRAY_API_ADDRESS);
-const hysteria2Files = new XrayConfigFileManager({
-  configPath: XRAY_CONFIG_PATH,
-  inboundTag: HYSTERIA2_INBOUND_TAG,
-});
 
 const app = express();
 app.use(express.json());
 
 const START_TIME = Date.now();
 
-// --- auth middleware, кроме /health ---
+// --- auth middleware, кроме /health и внутреннего хука Hysteria2 ---
+// /internal/hysteria/auth дёргает сам процесс hysteria-server (localhost,
+// та же машина), а не главный сервис — у него нет X-Node-Secret,
+// поэтому путь исключён из общего мидлвара по аналогии с /health.
+// Внешний трафик на этот путь в норме доходить не должен вообще,
+// т.к. hysteria-server и node-agent всегда на одном хосте.
 app.use((req, res, next) => {
-  if (req.path === "/health") return next();
+  if (req.path === "/health" || req.path === "/internal/hysteria/auth") {
+    return next();
+  }
   const secret = req.header("X-Node-Secret");
   if (!secret || secret !== NODE_API_SECRET) {
     return res.status(403).json({ error: "forbidden" });
@@ -83,27 +87,32 @@ function buildConfigLink(row) {
   });
 }
 
-async function xrayAddClient({ protocol, external_id, uuid, secret }) {
-  const email = emailTagFor(external_id);
+async function xrayAddClient({ protocol, external_id, uuid }) {
   if (protocol === "vless_reality") {
     await grpcClient.addVlessUser({
       tag: VLESS_INBOUND_TAG,
-      email,
+      email: emailTagFor(external_id),
       uuid,
       flow: "xtls-rprx-vision",
     });
-  } else {
-    hysteria2Files.addHysteria2Client({ email, password: secret });
   }
+  // hysteria2: Xray его не обслуживает, отдельный процесс hysteria-server
+  // не хранит список клиентов сам — авторизация идёт через HTTP-хук
+  // /internal/hysteria/auth на каждое подключение. Конфигурировать
+  // здесь нечего.
 }
 
 async function xrayRemoveClient({ protocol, external_id }) {
-  const email = emailTagFor(external_id);
   if (protocol === "vless_reality") {
-    await grpcClient.removeUser({ tag: VLESS_INBOUND_TAG, email });
-  } else {
-    hysteria2Files.removeHysteria2Client({ email });
+    await grpcClient.removeUser({
+      tag: VLESS_INBOUND_TAG,
+      email: emailTagFor(external_id),
+    });
   }
+  // hysteria2: см. комментарий в xrayAddClient. После db.deleteClient
+  // следующая же попытка подключения с этим паролем получит ok:false
+  // от /internal/hysteria/auth автоматически (findByHysteria2Password
+  // ничего не найдёт).
 }
 
 // --- GET /health ---
@@ -115,6 +124,44 @@ app.get("/health", async (req, res) => {
     uptime_seconds: Math.floor((Date.now() - START_TIME) / 1000),
     xray_version: xrayOk ? "reachable" : "unreachable",
   });
+});
+
+// --- POST /internal/hysteria/auth ---
+// Хук, который на каждое новое подключение клиента дёргает сам процесс
+// hysteria-server (auth.type: http в его конфиге). Тело запроса —
+// формат протокола apernet/hysteria HTTP auth: { addr, auth, tx }.
+app.post("/internal/hysteria/auth", async (req, res) => {
+  const { auth } = req.body || {};
+
+  if (!auth) {
+    logger.op("hysteria_auth", null, { ok: false, reason: "no_password" });
+    return res.json({ ok: false });
+  }
+
+  const row = db.findByHysteria2Password(auth);
+
+  if (!row) {
+    logger.op("hysteria_auth", null, { ok: false, reason: "not_found" });
+    return res.json({ ok: false });
+  }
+
+  if (
+    row.traffic_limit_bytes != null &&
+    row.bytes_uploaded + row.bytes_downloaded >= row.traffic_limit_bytes
+  ) {
+    logger.op("hysteria_auth", row.external_id, { ok: false, reason: "traffic_limit" });
+    return res.json({ ok: false });
+  }
+
+  if (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) {
+    logger.op("hysteria_auth", row.external_id, { ok: false, reason: "expired" });
+    return res.json({ ok: false });
+  }
+
+  // Именно external_id возвращается как id — он же ключ в trafficStats
+  // API Hysteria2, это критично для сведения статистики поллером.
+  logger.op("hysteria_auth", row.external_id, { ok: true });
+  res.json({ ok: true, id: row.external_id });
 });
 
 // --- POST /clients ---
@@ -197,6 +244,15 @@ app.get("/clients/:external_id/stats", async (req, res) => {
   const row = db.getClient(external_id);
   if (!row) return res.status(404).json({ error: "not found" });
 
+  if (row.protocol === "hysteria2") {
+    // Накопленные значения обновляются фоновым поллером
+    // (hysteriaTrafficPoller.js), живой запрос к Hysteria2 здесь не нужен.
+    return res.json({
+      bytes_uploaded: row.bytes_uploaded,
+      bytes_downloaded: row.bytes_downloaded,
+    });
+  }
+
   try {
     const stats = await grpcClient.getUserStats(emailTagFor(external_id));
     res.json(stats);
@@ -267,6 +323,13 @@ process.on("uncaughtException", (err) => {
   logger.error("uncaughtException", { error: err.message, stack: err.stack });
   // Не завершаем процесс намеренно — pm2 всё равно перезапустит при падении,
   // но по возможности хотим пережить одиночную ошибку в обработчике запроса.
+});
+
+startHysteriaTrafficPoller({
+  db,
+  statsUrl: HYSTERIA_TRAFFIC_STATS_URL,
+  secret: HYSTERIA_TRAFFIC_STATS_SECRET,
+  intervalMs: Number(HYSTERIA_TRAFFIC_POLL_INTERVAL_MS),
 });
 
 app.listen(Number(PORT), () => {
