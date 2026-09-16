@@ -15,14 +15,12 @@ const {
   PORT = "8443",
   NODE_API_SECRET,
   XRAY_API_ADDRESS = "127.0.0.1:10085",
-  REALITY_PUBLIC_KEY,
-  REALITY_SERVER_NAMES,
-  REALITY_SHORT_ID,
   VLESS_PORT = "443",
+  VLESS_WS_PATH,
+  VLESS_INBOUND_TAG = "vless-ws-in",
   HYSTERIA2_PORT = "8443",
   PUBLIC_HOST,
   HYSTERIA2_INSECURE = "1",
-  VLESS_INBOUND_TAG = "vless-reality-in",
   HYSTERIA_TRAFFIC_STATS_URL,
   HYSTERIA_TRAFFIC_STATS_SECRET,
   HYSTERIA_TRAFFIC_POLL_INTERVAL_MS = "30000",
@@ -36,6 +34,10 @@ if (!PUBLIC_HOST) {
   logger.error("PUBLIC_HOST is not set, refusing to start");
   process.exit(1);
 }
+if (!VLESS_WS_PATH) {
+  logger.error("VLESS_WS_PATH is not set, refusing to start");
+  process.exit(1);
+}
 
 const grpcClient = new XrayGrpcClient(XRAY_API_ADDRESS);
 
@@ -44,12 +46,6 @@ app.use(express.json());
 
 const START_TIME = Date.now();
 
-// --- auth middleware, кроме /health и внутреннего хука Hysteria2 ---
-// /internal/hysteria/auth дёргает сам процесс hysteria-server (localhost,
-// та же машина), а не главный сервис — у него нет X-Node-Secret,
-// поэтому путь исключён из общего мидлвара по аналогии с /health.
-// Внешний трафик на этот путь в норме доходить не должен вообще,
-// т.к. hysteria-server и node-agent всегда на одном хосте.
 app.use((req, res, next) => {
   if (req.path === "/health" || req.path === "/internal/hysteria/auth") {
     return next();
@@ -62,7 +58,6 @@ app.use((req, res, next) => {
 });
 
 function emailTagFor(externalId) {
-  // email/tag должен быть уникальным и стабильным для stats/gRPC
   return `client-${externalId}`;
 }
 
@@ -72,9 +67,7 @@ function buildConfigLink(row) {
       uuid: row.uuid,
       publicHost: PUBLIC_HOST,
       vlessPort: VLESS_PORT,
-      realityPublicKey: REALITY_PUBLIC_KEY,
-      realityServerNames: REALITY_SERVER_NAMES,
-      shortId: REALITY_SHORT_ID,
+      wsPath: VLESS_WS_PATH,
       externalId: row.external_id,
     });
   }
@@ -93,13 +86,8 @@ async function xrayAddClient({ protocol, external_id, uuid }) {
       tag: VLESS_INBOUND_TAG,
       email: emailTagFor(external_id),
       uuid,
-      flow: "xtls-rprx-vision",
     });
   }
-  // hysteria2: Xray его не обслуживает, отдельный процесс hysteria-server
-  // не хранит список клиентов сам — авторизация идёт через HTTP-хук
-  // /internal/hysteria/auth на каждое подключение. Конфигурировать
-  // здесь нечего.
 }
 
 async function xrayRemoveClient({ protocol, external_id }) {
@@ -109,13 +97,58 @@ async function xrayRemoveClient({ protocol, external_id }) {
       email: emailTagFor(external_id),
     });
   }
-  // hysteria2: см. комментарий в xrayAddClient. После db.deleteClient
-  // следующая же попытка подключения с этим паролем получит ok:false
-  // от /internal/hysteria/auth автоматически (findByHysteria2Password
-  // ничего не найдёт).
 }
 
-// --- GET /health ---
+/**
+ * Прогоняет всех vless-клиентов из локальной БД обратно в Xray через gRPC.
+ *
+ * ПОЧЕМУ ЭТО НУЖНО: config.json всегда содержит пустой settings.clients —
+ * реальные пользователи живут ТОЛЬКО в памяти запущенного процесса Xray,
+ * добавленные через AlterInbound. Раньше при любом `systemctl restart xray`
+ * (в т.ч. автоматическом после падения) ВСЕ существующие клиенты молча
+ * переставали подключаться, хотя их запись в SQLite оставалась цела — до
+ * первого ручного /regenerate. Это также ключевой кирпичик для полного
+ * пересоздания ноды (restore-node.js): после восстановления сервера с той
+ * же БД (или после replay через POST /clients с явным uuid) все клиенты
+ * должны сами оказаться в Xray без участия пользователя.
+ */
+async function replayExistingClientsIntoXray() {
+  const rows = db.db
+    .prepare(`SELECT * FROM clients WHERE protocol = 'vless_reality'`)
+    .all();
+
+  if (rows.length === 0) return;
+
+  logger.info(`replay: найдено ${rows.length} vless-клиентов, добавляем в Xray...`);
+
+  let xrayReady = false;
+  for (let attempt = 1; attempt <= 10; attempt += 1) {
+    xrayReady = await grpcClient.ping().catch(() => false);
+    if (xrayReady) break;
+    await new Promise((r) => setTimeout(r, 2000));
+  }
+  if (!xrayReady) {
+    logger.error("replay: Xray API недоступен после 10 попыток (20с), replay пропущен");
+    return;
+  }
+
+  let ok = 0;
+  let failed = 0;
+  for (const row of rows) {
+    try {
+      await xrayAddClient({ protocol: row.protocol, external_id: row.external_id, uuid: row.uuid });
+      ok += 1;
+    } catch (err) {
+      failed += 1;
+      logger.warn("replay: не удалось добавить клиента в Xray", {
+        external_id: row.external_id,
+        error: err.message,
+      });
+    }
+  }
+  logger.info(`replay: завершён, успешно=${ok}, ошибок=${failed}`);
+}
+
 app.get("/health", async (req, res) => {
   const xrayOk = await grpcClient.ping().catch(() => false);
   res.json({
@@ -126,10 +159,6 @@ app.get("/health", async (req, res) => {
   });
 });
 
-// --- POST /internal/hysteria/auth ---
-// Хук, который на каждое новое подключение клиента дёргает сам процесс
-// hysteria-server (auth.type: http в его конфиге). Тело запроса —
-// формат протокола apernet/hysteria HTTP auth: { addr, auth, tx }.
 app.post("/internal/hysteria/auth", async (req, res) => {
   const { auth } = req.body || {};
 
@@ -158,15 +187,18 @@ app.post("/internal/hysteria/auth", async (req, res) => {
     return res.json({ ok: false });
   }
 
-  // Именно external_id возвращается как id — он же ключ в trafficStats
-  // API Hysteria2, это критично для сведения статистики поллером.
   logger.op("hysteria_auth", row.external_id, { ok: true });
   res.json({ ok: true, id: row.external_id });
 });
 
 // --- POST /clients ---
+// ВАЖНО: поле uuid в теле запроса ОПЦИОНАЛЬНО. Обычная покупка его не
+// передаёт (генерируется новый uuidv4()). Оно нужно ИСКЛЮЧИТЕЛЬНО для
+// restore-node.js — при пересоздании упавшей ноды главный сервер повторно
+// создаёт всех клиентов, явно передавая их СТАРЫЙ uuid из своей БД, чтобы
+// у пользователя не поменялась ссылка подключения.
 app.post("/clients", async (req, res) => {
-  const { external_id, protocol, traffic_limit_bytes, expires_at } = req.body || {};
+  const { external_id, protocol, traffic_limit_bytes, expires_at, uuid } = req.body || {};
 
   if (!external_id || !["vless_reality", "hysteria2"].includes(protocol)) {
     return res.status(400).json({ error: "invalid external_id or protocol" });
@@ -177,17 +209,17 @@ app.post("/clients", async (req, res) => {
   }
 
   const isVless = protocol === "vless_reality";
-  const generatedUuid = isVless ? uuidv4() : null;
-  const generatedSecret = isVless
-    ? REALITY_SHORT_ID
-    : crypto.randomBytes(16).toString("hex");
+  const generatedUuid = isVless ? (uuid || uuidv4()) : null;
+  // Reality-shortId (общий "секрет" на ноду) больше не существует — для
+  // vless_reality (историческое имя протокола в схеме, по факту теперь
+  // TLS+WS) поле secret не используется вообще.
+  const generatedSecret = isVless ? null : crypto.randomBytes(16).toString("hex");
 
   try {
     await xrayAddClient({
       protocol,
       external_id,
       uuid: generatedUuid,
-      secret: generatedSecret,
     });
   } catch (err) {
     logger.error("failed to add client in Xray", {
@@ -207,16 +239,14 @@ app.post("/clients", async (req, res) => {
     expires_at: expires_at ?? null,
   });
 
-  logger.op("add", external_id, { protocol });
+  logger.op("add", external_id, { protocol, restored: Boolean(uuid) });
 
   res.status(201).json({
     uuid: row.uuid,
-    short_id: isVless ? REALITY_SHORT_ID : undefined,
     config_link: buildConfigLink(row),
   });
 });
 
-// --- DELETE /clients/:external_id ---
 app.delete("/clients/:external_id", async (req, res) => {
   const external_id = req.params.external_id;
   const row = db.getClient(external_id);
@@ -238,15 +268,12 @@ app.delete("/clients/:external_id", async (req, res) => {
   res.json({ ok: true });
 });
 
-// --- GET /clients/:external_id/stats ---
 app.get("/clients/:external_id/stats", async (req, res) => {
   const external_id = req.params.external_id;
   const row = db.getClient(external_id);
   if (!row) return res.status(404).json({ error: "not found" });
 
   if (row.protocol === "hysteria2") {
-    // Накопленные значения обновляются фоновым поллером
-    // (hysteriaTrafficPoller.js), живой запрос к Hysteria2 здесь не нужен.
     return res.json({
       bytes_uploaded: row.bytes_uploaded,
       bytes_downloaded: row.bytes_downloaded,
@@ -262,7 +289,6 @@ app.get("/clients/:external_id/stats", async (req, res) => {
   }
 });
 
-// --- POST /clients/:external_id/regenerate ---
 app.post("/clients/:external_id/regenerate", async (req, res) => {
   const external_id = req.params.external_id;
   const row = db.getClient(external_id);
@@ -270,9 +296,7 @@ app.post("/clients/:external_id/regenerate", async (req, res) => {
 
   const isVless = row.protocol === "vless_reality";
   const newUuid = isVless ? uuidv4() : null;
-  const newSecret = isVless
-    ? REALITY_SHORT_ID
-    : crypto.randomBytes(16).toString("hex");
+  const newSecret = isVless ? null : crypto.randomBytes(16).toString("hex");
 
   try {
     await xrayRemoveClient({ protocol: row.protocol, external_id });
@@ -280,7 +304,6 @@ app.post("/clients/:external_id/regenerate", async (req, res) => {
       protocol: row.protocol,
       external_id,
       uuid: newUuid,
-      secret: newSecret,
     });
   } catch (err) {
     logger.error("failed to regenerate client in Xray", {
@@ -305,12 +328,10 @@ app.post("/clients/:external_id/regenerate", async (req, res) => {
 
   res.json({
     uuid: newRow.uuid,
-    short_id: isVless ? REALITY_SHORT_ID : undefined,
     config_link: buildConfigLink(newRow),
   });
 });
 
-// --- глобальный обработчик ошибок, чтобы процесс не падал ---
 app.use((err, req, res, next) => {
   logger.error("unhandled error", { error: err.message, stack: err.stack });
   res.status(500).json({ error: "internal error" });
@@ -321,8 +342,6 @@ process.on("unhandledRejection", (reason) => {
 });
 process.on("uncaughtException", (err) => {
   logger.error("uncaughtException", { error: err.message, stack: err.stack });
-  // Не завершаем процесс намеренно — pm2 всё равно перезапустит при падении,
-  // но по возможности хотим пережить одиночную ошибку в обработчике запроса.
 });
 
 startHysteriaTrafficPoller({
@@ -334,4 +353,8 @@ startHysteriaTrafficPoller({
 
 app.listen(Number(PORT), () => {
   logger.info(`node-agent listening on port ${PORT}`);
+  // Не блокируем старт HTTP-сервера ожиданием Xray — реплей идёт в фоне.
+  replayExistingClientsIntoXray().catch((err) =>
+    logger.error("replay: непредвиденная ошибка", { error: err.message })
+  );
 });

@@ -4,20 +4,21 @@ function buildVlessLink({
   uuid,
   publicHost,
   vlessPort,
-  realityPublicKey,
-  realityServerNames,
-  shortId,
+  wsPath,
   externalId,
 }) {
-  const sni = realityServerNames.split(",")[0].trim();
+  // TLS+WebSocket за Cloudflare: настоящий сертификат на настоящий домен,
+  // никакой имитации чужого TLS-хендшейка (как было в Reality) — поэтому
+  // ни pbk/sid/serverNames тут больше нет, только обычные TLS+WS параметры.
+  // sni и host намеренно равны publicHost — это домен ноды, за которым
+  // стоит Cloudflare.
   const params = new URLSearchParams({
-    security: "reality",
-    sni,
+    security: "tls",
+    sni: publicHost,
     fp: "chrome",
-    pbk: realityPublicKey,
-    sid: shortId,
-    type: "tcp",
-    flow: "xtls-rprx-vision",
+    type: "ws",
+    host: publicHost,
+    path: wsPath,
     encryption: "none",
   });
   return `vless://${uuid}@${publicHost}:${vlessPort}?${params.toString()}#${encodeURIComponent(
