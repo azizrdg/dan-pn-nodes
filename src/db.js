@@ -19,9 +19,9 @@ db.exec(`
     external_id         TEXT PRIMARY KEY,
     protocol            TEXT NOT NULL CHECK(protocol IN ('vless_reality','hysteria2')),
     uuid                TEXT,           -- vless: user id. hysteria2: не используется
-    secret               TEXT,           -- hysteria2: password. vless: short_id
+    secret               TEXT,           -- hysteria2: password. vless: не используется
     email_tag           TEXT NOT NULL,  -- уникальный email/tag для Xray user / stats
-    traffic_limit_bytes INTEGER,
+    traffic_limit_bytes INTEGER,        -- NULL = без ограничения трафика (см. main миграцию)
     expires_at           TEXT,
     created_at           TEXT NOT NULL DEFAULT (datetime('now'))
   );
@@ -30,8 +30,7 @@ db.exec(`
 // --- миграция: bytes_uploaded / bytes_downloaded ---
 // Нужна для накопления трафика Hysteria2 (сам Hysteria2 отдаёт только
 // дельту с момента последнего опроса при clear=1, накопление обязано
-// жить у нас). Проверяем через PRAGMA, чтобы не сломать уже
-// развёрнутые на нодах базы без этих колонок.
+// жить у нас).
 (function migrateHysteriaTrafficColumns() {
   const columns = db.prepare(`PRAGMA table_info(clients)`).all();
   const columnNames = new Set(columns.map((c) => c.name));
@@ -44,10 +43,26 @@ db.exec(`
   }
 })();
 
+// --- миграция: device_limit ---
+// Лимит одновременных устройств, переданный главным сервисом при
+// создании клиента (см. main/src/nodes/client.js createClient). Сама
+// нода НЕ приостанавливает клиента при превышении лимита самостоятельно
+// (это решает main через агрегированный по ВСЕМ нодам подсчёт — см.
+// main/src/scheduler pollDeviceLimits) — колонка хранится здесь только
+// как метаданные для диагностики/будущего локального контроля.
+(function migrateDeviceLimitColumn() {
+  const columns = db.prepare(`PRAGMA table_info(clients)`).all();
+  const columnNames = new Set(columns.map((c) => c.name));
+
+  if (!columnNames.has("device_limit")) {
+    db.exec(`ALTER TABLE clients ADD COLUMN device_limit INTEGER`);
+  }
+})();
+
 const stmts = {
   insert: db.prepare(`
-    INSERT INTO clients (external_id, protocol, uuid, secret, email_tag, traffic_limit_bytes, expires_at)
-    VALUES (@external_id, @protocol, @uuid, @secret, @email_tag, @traffic_limit_bytes, @expires_at)
+    INSERT INTO clients (external_id, protocol, uuid, secret, email_tag, traffic_limit_bytes, expires_at, device_limit)
+    VALUES (@external_id, @protocol, @uuid, @secret, @email_tag, @traffic_limit_bytes, @expires_at, @device_limit)
   `),
   get: db.prepare(`SELECT * FROM clients WHERE external_id = ?`),
   delete: db.prepare(`DELETE FROM clients WHERE external_id = ?`),
@@ -66,7 +81,7 @@ const stmts = {
 module.exports = {
   db,
   createClient(row) {
-    stmts.insert.run(row);
+    stmts.insert.run({ device_limit: null, ...row });
     return stmts.get.get(row.external_id);
   },
   getClient(externalId) {

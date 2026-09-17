@@ -7,9 +7,9 @@ const logger = require("./logger");
  * hysteria-server (127.0.0.1:9999 по умолчанию) и накапливает дельты
  * трафика в БД через db.incrementTraffic.
  *
- * Формат ответа: { "<external_id>": { "tx": <int>, "rx": <int> }, ... }
+ * Формат ответа /traffic: { "<external_id>": { "tx": <int>, "rx": <int> }, ... }
  * — только по клиентам, у которых была активность с прошлого опроса
- * (clear=1). "<external_id>" — это то же значение, которое node-agent
+ * (clear=1). "<external_id>" — то же значение, которое node-agent
  * вернул в ответе /internal/hysteria/auth как "id".
  *
  * Запускается только если передан statsUrl (т.е. в .env задан
@@ -28,10 +28,6 @@ function startHysteriaTrafficPoller({ db, statsUrl, secret, intervalMs }) {
     try {
       const url = `${statsUrl.replace(/\/$/, "")}/traffic?clear=1`;
 
-      // Формат авторизации подтверждён по документации apernet/hysteria
-      // для http trafficStats API: заголовок Authorization: Bearer <secret>.
-      // Если версия hysteria-server, которую ставит add-node.js,
-      // использует другой заголовок — поменять здесь.
       const res = await fetch(url, {
         headers: secret ? { Authorization: `Bearer ${secret}` } : {},
       });
@@ -50,8 +46,6 @@ function startHysteriaTrafficPoller({ db, statsUrl, secret, intervalMs }) {
         db.incrementTraffic(externalId, tx, rx);
       }
     } catch (err) {
-      // Сервис Hysteria2 недоступен или ответ некорректен — не падаем,
-      // просто ждём следующего тика.
       logger.warn("hysteria traffic poll failed", { error: err.message });
     }
   }
@@ -64,4 +58,33 @@ function startHysteriaTrafficPoller({ db, statsUrl, secret, intervalMs }) {
   return timer;
 }
 
-module.exports = { startHysteriaTrafficPoller };
+/**
+ * Разовый запрос количества АКТИВНЫХ СОЕДИНЕНИЙ конкретного клиента через
+ * эндпоинт /online trafficStats API Hysteria2 (в отличие от /traffic,
+ * ничего не "очищает" — можно опрашивать в любой момент по требованию).
+ * Формат ответа: { "<external_id>": <кол-во соединений>, ... }.
+ *
+ * ВАЖНО: это количество СОЕДИНЕНИЙ, а не уникальных IP (в отличие от
+ * VLESS-подсчёта через deviceLimiter.js) — для Hysteria2 у нас нет
+ * дешёвого способа получить исходные IP через HTTP trafficStats API,
+ * поэтому используется как приблизительная эвристика количества
+ * устройств (см. index.js GET /clients/:id/devices).
+ */
+async function getOnlineCount(statsUrl, secret, externalId) {
+  if (!statsUrl) return 0;
+  try {
+    const url = `${statsUrl.replace(/\/$/, "")}/online`;
+    const res = await fetch(url, {
+      headers: secret ? { Authorization: `Bearer ${secret}` } : {},
+    });
+    if (!res.ok) return 0;
+    const data = await res.json();
+    const value = data && data[externalId];
+    return Number(value) || 0;
+  } catch (err) {
+    logger.warn("hysteria online query failed", { error: err.message });
+    return 0;
+  }
+}
+
+module.exports = { startHysteriaTrafficPoller, getOnlineCount };

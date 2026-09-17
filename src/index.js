@@ -9,7 +9,8 @@ const logger = require("./logger");
 const db = require("./db");
 const { XrayGrpcClient } = require("./xrayGrpc");
 const { buildVlessLink, buildHysteria2Link } = require("./linkBuilder");
-const { startHysteriaTrafficPoller } = require("./hysteriaTrafficPoller");
+const { startHysteriaTrafficPoller, getOnlineCount } = require("./hysteriaTrafficPoller");
+const { DeviceLimiter } = require("./deviceLimiter");
 
 const {
   PORT = "8443",
@@ -19,11 +20,18 @@ const {
   VLESS_WS_PATH,
   VLESS_INBOUND_TAG = "vless-ws-in",
   HYSTERIA2_PORT = "8443",
+  // ОБЩИЙ для всех нод хост VLESS (Cloudflare Load Balancer) — НЕ адрес
+  // этой конкретной ноды.
   PUBLIC_HOST,
+  // ОБЩИЙ для всех нод хост Hysteria2 (DNS round-robin). Если не задан
+  // отдельно — используем PUBLIC_HOST (обратная совместимость со
+  // старыми нодами, добавленными до разделения хостов).
+  HYSTERIA_PUBLIC_HOST,
   HYSTERIA2_INSECURE = "1",
   HYSTERIA_TRAFFIC_STATS_URL,
   HYSTERIA_TRAFFIC_STATS_SECRET,
   HYSTERIA_TRAFFIC_POLL_INTERVAL_MS = "30000",
+  XRAY_ACCESS_LOG_PATH = "/var/log/xray/access.log",
 } = process.env;
 
 if (!NODE_API_SECRET) {
@@ -39,7 +47,10 @@ if (!VLESS_WS_PATH) {
   process.exit(1);
 }
 
+const hysteriaPublicHost = HYSTERIA_PUBLIC_HOST || PUBLIC_HOST;
+
 const grpcClient = new XrayGrpcClient(XRAY_API_ADDRESS);
+const deviceLimiter = new DeviceLimiter({ logPath: XRAY_ACCESS_LOG_PATH });
 
 const app = express();
 app.use(express.json());
@@ -73,7 +84,7 @@ function buildConfigLink(row) {
   }
   return buildHysteria2Link({
     password: row.secret,
-    publicHost: PUBLIC_HOST,
+    host: hysteriaPublicHost,
     hysteria2Port: HYSTERIA2_PORT,
     insecure: HYSTERIA2_INSECURE === "1",
     externalId: row.external_id,
@@ -100,17 +111,9 @@ async function xrayRemoveClient({ protocol, external_id }) {
 }
 
 /**
- * Прогоняет всех vless-клиентов из локальной БД обратно в Xray через gRPC.
- *
- * ПОЧЕМУ ЭТО НУЖНО: config.json всегда содержит пустой settings.clients —
- * реальные пользователи живут ТОЛЬКО в памяти запущенного процесса Xray,
- * добавленные через AlterInbound. Раньше при любом `systemctl restart xray`
- * (в т.ч. автоматическом после падения) ВСЕ существующие клиенты молча
- * переставали подключаться, хотя их запись в SQLite оставалась цела — до
- * первого ручного /regenerate. Это также ключевой кирпичик для полного
- * пересоздания ноды (restore-node.js): после восстановления сервера с той
- * же БД (или после replay через POST /clients с явным uuid) все клиенты
- * должны сами оказаться в Xray без участия пользователя.
+ * Прогоняет всех vless-клиентов из локальной БД обратно в Xray через gRPC
+ * при старте процесса (реальные пользователи Xray живут только в памяти
+ * запущенного процесса — settings.clients в config.json всегда пуст).
  */
 async function replayExistingClientsIntoXray() {
   const rows = db.db
@@ -192,13 +195,15 @@ app.post("/internal/hysteria/auth", async (req, res) => {
 });
 
 // --- POST /clients ---
-// ВАЖНО: поле uuid в теле запроса ОПЦИОНАЛЬНО. Обычная покупка его не
-// передаёт (генерируется новый uuidv4()). Оно нужно ИСКЛЮЧИТЕЛЬНО для
-// restore-node.js — при пересоздании упавшей ноды главный сервер повторно
-// создаёт всех клиентов, явно передавая их СТАРЫЙ uuid из своей БД, чтобы
-// у пользователя не поменялась ссылка подключения.
+// uuid ОПЦИОНАЛЕН — обычная покупка его не передаёт (генерируется новый
+// uuidv4()). Передаётся ЯВНО главным сервисом при restore-node.js/
+// update-node.js (реплей клиентов на пересозданную/переустановленную
+// ноду), чтобы у пользователя не поменялась ссылка подключения.
+// device_limit — лимит одновременных устройств (см. main/src/nodes/
+// client.js createClient); сама нода его не проверяет — только хранит
+// как метаданные, реальная проверка агрегируется на главном сервисе.
 app.post("/clients", async (req, res) => {
-  const { external_id, protocol, traffic_limit_bytes, expires_at, uuid } = req.body || {};
+  const { external_id, protocol, traffic_limit_bytes, expires_at, uuid, device_limit } = req.body || {};
 
   if (!external_id || !["vless_reality", "hysteria2"].includes(protocol)) {
     return res.status(400).json({ error: "invalid external_id or protocol" });
@@ -210,9 +215,6 @@ app.post("/clients", async (req, res) => {
 
   const isVless = protocol === "vless_reality";
   const generatedUuid = isVless ? (uuid || uuidv4()) : null;
-  // Reality-shortId (общий "секрет" на ноду) больше не существует — для
-  // vless_reality (историческое имя протокола в схеме, по факту теперь
-  // TLS+WS) поле secret не используется вообще.
   const generatedSecret = isVless ? null : crypto.randomBytes(16).toString("hex");
 
   try {
@@ -237,6 +239,7 @@ app.post("/clients", async (req, res) => {
     email_tag: emailTagFor(external_id),
     traffic_limit_bytes: traffic_limit_bytes ?? null,
     expires_at: expires_at ?? null,
+    device_limit: device_limit ?? null,
   });
 
   logger.op("add", external_id, { protocol, restored: Boolean(uuid) });
@@ -289,6 +292,33 @@ app.get("/clients/:external_id/stats", async (req, res) => {
   }
 });
 
+/**
+ * GET /clients/:external_id/devices — приблизительное количество/список
+ * "устройств" (уникальных источников) клиента ТОЛЬКО на ЭТОЙ ноде.
+ * Главный сервис объединяет результат со ВСЕХ активных нод (см.
+ * nodes/replication.js getAggregatedDeviceCount), так как клиент может
+ * подключаться к разным нодам в разных сессиях.
+ */
+app.get("/clients/:external_id/devices", async (req, res) => {
+  const external_id = req.params.external_id;
+  const row = db.getClient(external_id);
+  if (!row) return res.status(404).json({ error: "not found" });
+
+  if (row.protocol === "hysteria2") {
+    // Hysteria2 trafficStats отдаёт только КОЛИЧЕСТВО активных соединений
+    // по auth id, а не их IP (в отличие от VLESS через deviceLimiter.js).
+    // Возвращаем count синтетических псевдо-"устройств", чтобы главный
+    // сервис мог просуммировать их той же логикой дедупликации по строке
+    // — точность ниже, чем для VLESS, но достаточно для защиты от
+    // расшаривания одной подписки.
+    const count = await getOnlineCount(HYSTERIA_TRAFFIC_STATS_URL, HYSTERIA_TRAFFIC_STATS_SECRET, external_id);
+    const ips = Array.from({ length: count }, (_, i) => `hysteria2:${external_id}:${i}`);
+    return res.json({ ips });
+  }
+
+  return res.json({ ips: deviceLimiter.getIps(external_id) });
+});
+
 app.post("/clients/:external_id/regenerate", async (req, res) => {
   const external_id = req.params.external_id;
   const row = db.getClient(external_id);
@@ -322,6 +352,7 @@ app.post("/clients/:external_id/regenerate", async (req, res) => {
     email_tag: emailTagFor(external_id),
     traffic_limit_bytes: row.traffic_limit_bytes,
     expires_at: row.expires_at,
+    device_limit: row.device_limit,
   });
 
   logger.op("regenerate", external_id, { protocol: row.protocol });
@@ -350,6 +381,8 @@ startHysteriaTrafficPoller({
   secret: HYSTERIA_TRAFFIC_STATS_SECRET,
   intervalMs: Number(HYSTERIA_TRAFFIC_POLL_INTERVAL_MS),
 });
+
+deviceLimiter.start();
 
 app.listen(Number(PORT), () => {
   logger.info(`node-agent listening on port ${PORT}`);
