@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Эпоха — конвертер Unix-времени</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#efece3;
+    --panel:#f7f5ee;
+    --ink:#221f19;
+    --ink-soft:#5a5546;
+    --brass:#9c6b30;
+    --brass-deep:#7c5223;
+    --teal:#33505a;
+    --line:#d9d2bf;
+    --line-strong:#c3b89e;
+    --good:#3f6b4a;
+    --bad:#a2402f;
+    --shadow: rgba(34,31,25,0.12);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --paper:#1b1912;
+      --panel:#242119;
+      --ink:#eee9dc;
+      --ink-soft:#a89f8a;
+      --brass:#d4a35f;
+      --brass-deep:#e8bd7e;
+      --teal:#7fa3ad;
+      --line:#3a3626;
+      --line-strong:#4c4630;
+      --good:#7fbf8f;
+      --bad:#e28170;
+      --shadow: rgba(0,0,0,0.4);
+    }
+  }
+  :root[data-theme="dark"]{
+    --paper:#1b1912;
+    --panel:#242119;
+    --ink:#eee9dc;
+    --ink-soft:#a89f8a;
+    --brass:#d4a35f;
+    --brass-deep:#e8bd7e;
+    --teal:#7fa3ad;
+    --line:#3a3626;
+    --line-strong:#4c4630;
+    --good:#7fbf8f;
+    --bad:#e28170;
+    --shadow: rgba(0,0,0,0.4);
+  }
+
+  *{box-sizing:border-box;}
+  html,body{margin:0;padding:0;}
+  body{
+    background:var(--paper);
+    color:var(--ink);
+    font-family:'IBM Plex Sans', -apple-system, sans-serif;
+    min-height:100vh;
+    padding:32px 20px 80px;
+  }
+  .wrap{
+    max-width:900px;
+    margin:0 auto;
+  }
+
+  header{
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:16px;
+    margin-bottom:28px;
+    flex-wrap:wrap;
+  }
+  h1{
+    font-size:1.15rem;
+    font-weight:600;
+    margin:0;
+    letter-spacing:0.01em;
+  }
+  h1 span{color:var(--brass-deep);}
+  .tz{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:0.8rem;
+    color:var(--ink-soft);
+  }
+
+  /* Hero counter */
+  .counter-frame{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:4px;
+    padding:28px 24px 22px;
+    box-shadow:0 1px 0 var(--line-strong) inset, 0 8px 24px -12px var(--shadow);
+    position:relative;
+    overflow:hidden;
+  }
+  .counter-frame::before{
+    content:"";
+    position:absolute;
+    top:0; left:0; right:0;
+    height:3px;
+    background:linear-gradient(90deg, var(--brass), transparent 70%);
+  }
+  .counter-label{
+    font-size:0.72rem;
+    color:var(--ink-soft);
+    margin-bottom:10px;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+  }
+  .counter-digits{
+    font-family:'IBM Plex Mono', monospace;
+    font-weight:600;
+    font-size:clamp(2.1rem, 8vw, 3.6rem);
+    letter-spacing:0.01em;
+    line-height:1;
+    color:var(--ink);
+    display:flex;
+    flex-wrap:wrap;
+    align-items:baseline;
+    gap:2px;
+  }
+  .counter-digits .unit{
+    font-size:0.32em;
+    color:var(--ink-soft);
+    margin-left:8px;
+    font-weight:500;
+    font-family:'IBM Plex Sans', sans-serif;
+  }
+  .counter-sub{
+    margin-top:14px;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:0.85rem;
+    color:var(--teal);
+    display:flex;
+    justify-content:space-between;
+    flex-wrap:wrap;
+    gap:8px;
+  }
+  .copy-mini{
+    background:none;
+    border:none;
+    color:var(--brass-deep);
+    cursor:pointer;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:0.72rem;
+    padding:2px 0;
+    border-bottom:1px solid transparent;
+  }
+  .copy-mini:hover{border-bottom-color:var(--brass-deep);}
+
+  /* Converter panels */
+  .panels{
+    display:grid;
+    grid-template-columns:1fr 1fr;
+    gap:16px;
+    margin-top:22px;
+  }
+  @media (max-width:640px){
+    .panels{grid-template-columns:1fr;}
+  }
+  .panel{
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:4px;
+    padding:20px;
+  }
+  .panel h2{
+    font-size:0.78rem;
+    font-weight:600;
+    margin:0 0 14px;
+    color:var(--ink-soft);
+    text-transform:uppercase;
+    letter-spacing:0.06em;
+  }
+  label{
+    display:block;
+    font-size:0.78rem;
+    color:var(--ink-soft);
+    margin-bottom:6px;
+  }
+  input[type="text"], input[type="datetime-local"], select{
+    width:100%;
+    font-family:'IBM Plex Mono', monospace;
+    font-size:0.95rem;
+    padding:10px 12px;
+    background:var(--paper);
+    border:1px solid var(--line-strong);
+    border-radius:3px;
+    color:var(--ink);
+    margin-bottom:12px;
+  }
+  input:focus, select:focus{
+    outline:2px solid var(--brass);
+    outline-offset:1px;
+    border-color:var(--brass);
+  }
+  .row-inline{
+    display:flex;
+    gap:8px;
+  }
+  .row-inline select{margin-bottom:12px;}
+  .result-line{
+    font-family:'IBM Plex Mono', monospace;
+    font-size:0.92rem;
+    padding:10px 12px;
+    background:var(--paper);
+    border:1px dashed var(--line-strong);
+    border-radius:3px;
+    color:var(--ink);
+    min-height:20px;
+    word-break:break-word;
+  }
+  .result-line.error{
+    color:var(--bad);
+    border-color:var(--bad);
+  }
+  .hint{
+    font-size:0.72rem;
+    color:var(--ink-soft);
+    margin-top:6px;
+  }
+
+  /* Formats table */
+  .formats{
+    margin-top:22px;
+    background:var(--panel);
+    border:1px solid var(--line);
+    border-radius:4px;
+    padding:20px;
+  }
+  .formats h2{
+    font-size:0.78rem;
+    font-weight:600;
+    margin:0 0 14px;
+    color:var(--ink-soft);
+    text-transform:uppercase;
+    letter-spacing:0.06em;
+  }
+  table{
+    width:100%;
+    border-collapse:collapse;
+  }
+  td{
+    padding:8px 4px;
+    font-size:0.86rem;
+    border-top:1px solid var(--line);
+  }
+  tr:first-child td{border-top:none;}
+  td.fmt-name{
+    color:var(--ink-soft);
+    width:38%;
+    white-space:nowrap;
+  }
+  td.fmt-val{
+    font-family:'IBM Plex Mono', monospace;
+    color:var(--ink);
+    word-break:break-word;
+  }
+  .fmt-copy{
+    background:none;
+    border:none;
+    color:var(--brass-deep);
+    cursor:pointer;
+    font-size:0.72rem;
+    padding:0;
+    margin-left:10px;
+    text-decoration:underline;
+    text-underline-offset:2px;
+  }
+
+  footer{
+    margin-top:28px;
+    font-size:0.76rem;
+    color:var(--ink-soft);
+    line-height:1.6;
+    border-top:1px solid var(--line);
+    padding-top:16px;
+  }
+  footer strong{color:var(--teal);}
+
+  .theme-toggle{
+    background:none;
+    border:1px solid var(--line-strong);
+    border-radius:3px;
+    color:var(--ink-soft);
+    font-size:0.72rem;
+    padding:5px 10px;
+    cursor:pointer;
+    font-family:'IBM Plex Mono', monospace;
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <h1>Эпох<span>а</span> · конвертер Unix-времени</h1>
+    <button class="theme-toggle" id="themeToggle" type="button">тема</button>
+  </header>
+
+  <div class="counter-frame">
+    <div class="counter-label">
+      <span>Сейчас, секунды с 1 января 1970 UTC</span>
+      <span id="localTz" class="tz"></span>
+    </div>
+    <div class="counter-digits" id="liveEpoch">—</div>
+    <div class="counter-sub">
+      <span id="liveHuman">—</span>
+      <button class="copy-mini" id="copyLive" type="button">скопировать</button>
+    </div>
+  </div>
+
+  <div class="panels">
+    <div class="panel">
+      <h2>Timestamp → дата</h2>
+      <label for="inEpoch">Unix timestamp</label>
+      <div class="row-inline">
+        <input type="text" id="inEpoch" placeholder="например, 1737331200" inputmode="numeric">
+        <select id="epochUnit">
+          <option value="s">сек</option>
+          <option value="ms">мс</option>
+        </select>
+      </div>
+      <div class="result-line" id="outDate">—</div>
+      <div class="hint">Показано в UTC и в вашем часовом поясе</div>
+    </div>
+
+    <div class="panel">
+      <h2>Дата → timestamp</h2>
+      <label for="inDate">Дата и время (локальное)</label>
+      <input type="datetime-local" id="inDate" step="1">
+      <div class="result-line" id="outEpoch">—</div>
+      <div class="hint">Секунды и миллисекунды с начала эпохи</div>
+    </div>
+  </div>
+
+  <div class="formats">
+    <h2>Форматы для «сейчас»</h2>
+    <table id="formatsTable"></table>
+  </div>
+
+  <footer>
+    Всё вычисляется прямо в браузере, ничего никуда не отправляется.
+    <strong>На заметку:</strong> 19 января 2038 года в 03:14:07 UTC 32-битный знаковый счётчик секунд переполнится — так называемая «проблема 2038 года».
+  </footer>
+
+</div>
+
+<script>
+(function(){
+  const liveEpochEl = document.getElementById('liveEpoch');
+  const liveHumanEl = document.getElementById('liveHuman');
+  const localTzEl = document.getElementById('localTz');
+  const copyLiveBtn = document.getElementById('copyLive');
+
+  const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  localTzEl.textContent = tz;
+
+  function pad(n){ return String(n).padStart(2,'0'); }
+
+  function tick(){
+    const now = new Date();
+    const s = Math.floor(now.getTime()/1000);
+    liveEpochEl.innerHTML = s.toLocaleString('en-US').replace(/,/g,' ') + '<span class="unit">сек</span>';
+    liveHumanEl.textContent = now.toLocaleString('ru-RU', {dateStyle:'medium', timeStyle:'medium'});
+  }
+  tick();
+  setInterval(tick, 1000);
+
+  copyLiveBtn.addEventListener('click', function(){
+    const s = Math.floor(Date.now()/1000);
+    navigator.clipboard.writeText(String(s)).then(()=>{
+      copyLiveBtn.textContent = 'скопировано';
+      setTimeout(()=>copyLiveBtn.textContent='скопировать', 1200);
+    }).catch(()=>{});
+  });
+
+  // Timestamp -> date
+  const inEpoch = document.getElementById('inEpoch');
+  const epochUnit = document.getElementById('epochUnit');
+  const outDate = document.getElementById('outDate');
+
+  function renderEpochToDate(){
+    const raw = inEpoch.value.trim();
+    if(!raw){ outDate.textContent = '—'; outDate.classList.remove('error'); return; }
+    if(!/^-?\d+(\.\d+)?$/.test(raw)){
+      outDate.textContent = 'Введите число';
+      outDate.classList.add('error');
+      return;
+    }
+    let n = parseFloat(raw);
+    if(epochUnit.value === 's') n = n * 1000;
+    const d = new Date(n);
+    if(isNaN(d.getTime())){
+      outDate.textContent = 'Значение вне допустимого диапазона';
+      outDate.classList.add('error');
+      return;
+    }
+    outDate.classList.remove('error');
+    const utcStr = d.toUTCString();
+    const localStr = d.toLocaleString('ru-RU', {dateStyle:'full', timeStyle:'medium'});
+    outDate.innerHTML = 'UTC:  ' + utcStr + '<br>Локально (' + tz + '):  ' + localStr;
+  }
+  inEpoch.addEventListener('input', renderEpochToDate);
+  epochUnit.addEventListener('change', renderEpochToDate);
+
+  // Date -> timestamp
+  const inDateEl = document.getElementById('inDate');
+  const outEpoch = document.getElementById('outEpoch');
+
+  function setDefaultDateTime(){
+    const now = new Date();
+    const local = new Date(now.getTime() - now.getTimezoneOffset()*60000);
+    inDateEl.value = local.toISOString().slice(0,19);
+  }
+  setDefaultDateTime();
+
+  function renderDateToEpoch(){
+    const val = inDateEl.value;
+    if(!val){ outEpoch.textContent = '—'; return; }
+    const d = new Date(val);
+    if(isNaN(d.getTime())){
+      outEpoch.textContent = 'Некорректная дата';
+      outEpoch.classList.add('error');
+      return;
+    }
+    outEpoch.classList.remove('error');
+    const s = Math.floor(d.getTime()/1000);
+    outEpoch.innerHTML = 'Секунды:  ' + s + '<br>Миллисекунды:  ' + d.getTime();
+  }
+  inDateEl.addEventListener('input', renderDateToEpoch);
+  renderDateToEpoch();
+  renderEpochToDate();
+
+  // Formats table for "now" — refresh each render pass but keep steady per second
+  const formatsTable = document.getElementById('formatsTable');
+  function buildFormats(){
+    const now = new Date();
+    const rows = [
+      ['ISO 8601', now.toISOString()],
+      ['UTC-строка', now.toUTCString()],
+      ['Unix, секунды', String(Math.floor(now.getTime()/1000))],
+      ['Unix, миллисекунды', String(now.getTime())],
+      ['Локальная строка', now.toLocaleString('ru-RU', {dateStyle:'long', timeStyle:'medium'})],
+      ['Год-месяц-день', now.toISOString().slice(0,10)]
+    ];
+    formatsTable.innerHTML = rows.map(function(r){
+      return '<tr><td class="fmt-name">'+r[0]+'</td><td class="fmt-val">'+r[1]+
+        '<button class="fmt-copy" data-val="'+r[1].replace(/"/g,'&quot;')+'">копировать</button></td></tr>';
+    }).join('');
+    formatsTable.querySelectorAll('.fmt-copy').forEach(function(btn){
+      btn.addEventListener('click', function(){
+        navigator.clipboard.writeText(btn.getAttribute('data-val')).then(function(){
+          const orig = btn.textContent;
+          btn.textContent = 'готово';
+          setTimeout(()=>btn.textContent=orig, 1000);
+        }).catch(()=>{});
+      });
+    });
+  }
+  buildFormats();
+  setInterval(buildFormats, 1000);
+
+  // Theme toggle (per-viewer convenience only)
+  const themeToggle = document.getElementById('themeToggle');
+  try{
+    const saved = localStorage.getItem('epoch-tool-theme');
+    if(saved) document.documentElement.setAttribute('data-theme', saved);
+  }catch(e){}
+  themeToggle.addEventListener('click', function(){
+    const cur = document.documentElement.getAttribute('data-theme');
+    const next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try{ localStorage.setItem('epoch-tool-theme', next); }catch(e){}
+  });
+})();
+</script>
+</body>
+</html>
