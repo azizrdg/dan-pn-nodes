@@ -11,6 +11,7 @@ const { XrayGrpcClient } = require("./xrayGrpc");
 const { buildVlessLink, buildHysteria2Link } = require("./linkBuilder");
 const { startHysteriaTrafficPoller, getOnlineCount } = require("./hysteriaTrafficPoller");
 const { DeviceLimiter } = require("./deviceLimiter");
+const { startMainSync } = require("./mainSync");
 
 const {
   PORT = "8443",
@@ -32,6 +33,10 @@ const {
   HYSTERIA_TRAFFIC_STATS_SECRET,
   HYSTERIA_TRAFFIC_POLL_INTERVAL_MS = "30000",
   XRAY_ACCESS_LOG_PATH = "/var/log/xray/access.log",
+  // Pull-синхронизация с главным сервисом (см. mainSync.js): URL эндпоинта
+  // главного сервиса и интервал (по умолчанию 10 минут).
+  MAIN_SYNC_URL,
+  MAIN_SYNC_INTERVAL_MS = "600000",
 } = process.env;
 
 if (!NODE_API_SECRET) {
@@ -51,6 +56,14 @@ const hysteriaPublicHost = HYSTERIA_PUBLIC_HOST || PUBLIC_HOST;
 
 const grpcClient = new XrayGrpcClient(XRAY_API_ADDRESS);
 const deviceLimiter = new DeviceLimiter({ logPath: XRAY_ACCESS_LOG_PATH });
+
+// external_id -> время (ms), когда API (запросы главного сервиса) в последний
+// раз создавал/удалял/пересоздавал этого клиента. Нужна pull-синхронизации,
+// чтобы не перебить свежее изменение устаревшим списком (см. mainSync.js).
+const apiTouched = new Map();
+function touch(externalId) {
+  apiTouched.set(String(externalId), Date.now());
+}
 
 const app = express();
 app.use(express.json());
@@ -114,6 +127,8 @@ async function xrayRemoveClient({ protocol, external_id }) {
  * Прогоняет всех vless-клиентов из локальной БД обратно в Xray через gRPC
  * при старте процесса (реальные пользователи Xray живут только в памяти
  * запущенного процесса — settings.clients в config.json всегда пуст).
+ * Лишних клиентов (заблокированных/истёкших) уберёт pull-синхронизация
+ * (mainSync.js) вскоре после старта.
  */
 async function replayExistingClientsIntoXray() {
   const rows = db.db
@@ -209,6 +224,8 @@ app.post("/clients", async (req, res) => {
     return res.status(400).json({ error: "invalid external_id or protocol" });
   }
 
+  touch(external_id);
+
   if (db.getClient(external_id)) {
     return res.status(409).json({ error: "client already exists" });
   }
@@ -252,6 +269,7 @@ app.post("/clients", async (req, res) => {
 
 app.delete("/clients/:external_id", async (req, res) => {
   const external_id = req.params.external_id;
+  touch(external_id);
   const row = db.getClient(external_id);
   if (!row) return res.status(404).json({ error: "not found" });
 
@@ -321,6 +339,7 @@ app.get("/clients/:external_id/devices", async (req, res) => {
 
 app.post("/clients/:external_id/regenerate", async (req, res) => {
   const external_id = req.params.external_id;
+  touch(external_id);
   const row = db.getClient(external_id);
   if (!row) return res.status(404).json({ error: "not found" });
 
@@ -390,4 +409,18 @@ app.listen(Number(PORT), () => {
   replayExistingClientsIntoXray().catch((err) =>
     logger.error("replay: непредвиденная ошибка", { error: err.message })
   );
+
+  // Pull-синхронизация с главным сервисом (первый цикл — через ~20 с,
+  // после реплея, далее раз в MAIN_SYNC_INTERVAL_MS).
+  startMainSync({
+    db,
+    grpcClient,
+    xrayAddClient,
+    xrayRemoveClient,
+    emailTagFor,
+    touched: apiTouched,
+    url: MAIN_SYNC_URL,
+    secret: NODE_API_SECRET,
+    intervalMs: Math.max(60000, Number(MAIN_SYNC_INTERVAL_MS) || 600000),
+  });
 });
