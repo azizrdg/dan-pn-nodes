@@ -86,10 +86,10 @@ class XrayGrpcClient {
    * просто проигнорирует/отклонит. Раньше здесь был параметр flow, завязанный
    * на Reality — с уходом от Reality он больше не нужен.
    */
-  async addVlessUser({ tag, email, uuid }) {
+  async addVlessUser({ tag, email, uuid, flow = "" }) {
     const account = await this._packTypedMessage("xray.proxy.vless.Account", {
       id: uuid,
-      flow: "",
+      flow,
       encryption: "none",
     });
 
@@ -122,6 +122,11 @@ class XrayGrpcClient {
         reset: false,
       }),
     ]);
+
+    // Отсутствующий счётчик означает нулевой расход. Ошибка API/таймаут
+    // не означает сброс: иначе следующий опрос повторно начислит трафик.
+    const failure = [up, down].find((r) => r.status === 'rejected' && r.reason.code !== grpc.status.NOT_FOUND);
+    if (failure) throw failure.reason;
 
     const value = (res) =>
       res.status === "fulfilled" && res.value && res.value.stat

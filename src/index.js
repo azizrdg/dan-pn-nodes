@@ -9,7 +9,7 @@ const logger = require("./logger");
 const db = require("./db");
 const { XrayGrpcClient } = require("./xrayGrpc");
 const { buildVlessLink, buildHysteria2Link } = require("./linkBuilder");
-const { startHysteriaTrafficPoller, getOnlineCount } = require("./hysteriaTrafficPoller");
+const { startHysteriaTrafficPoller, getOnlineCount, kickClients } = require("./hysteriaTrafficPoller");
 const { DeviceLimiter } = require("./deviceLimiter");
 const { startMainSync } = require("./mainSync");
 
@@ -20,6 +20,7 @@ const {
   VLESS_PORT = "443",
   VLESS_WS_PATH,
   VLESS_INBOUND_TAG = "vless-ws-in",
+  VLESS_REALITY_INBOUND_TAG,
   HYSTERIA2_PORT = "8443",
   // ОБЩИЙ для всех нод хост VLESS (Cloudflare Load Balancer) — НЕ адрес
   // этой конкретной ноды.
@@ -30,6 +31,7 @@ const {
   HYSTERIA_PUBLIC_HOST,
   HYSTERIA2_INSECURE = "1",
   HYSTERIA_TRAFFIC_STATS_URL,
+  HYSTERIA_TRAFFIC_STATS_ADDRESS,
   HYSTERIA_TRAFFIC_STATS_SECRET,
   HYSTERIA_TRAFFIC_POLL_INTERVAL_MS = "30000",
   XRAY_ACCESS_LOG_PATH = "/var/log/xray/access.log",
@@ -52,6 +54,7 @@ if (!VLESS_WS_PATH) {
   process.exit(1);
 }
 
+const hysteriaStatsUrl = HYSTERIA_TRAFFIC_STATS_URL || (HYSTERIA_TRAFFIC_STATS_ADDRESS ? `http://${HYSTERIA_TRAFFIC_STATS_ADDRESS}` : null);
 const hysteriaPublicHost = HYSTERIA_PUBLIC_HOST || PUBLIC_HOST;
 
 const grpcClient = new XrayGrpcClient(XRAY_API_ADDRESS);
@@ -105,22 +108,34 @@ function buildConfigLink(row) {
 }
 
 async function xrayAddClient({ protocol, external_id, uuid }) {
-  if (protocol === "vless_reality") {
-    await grpcClient.addVlessUser({
-      tag: VLESS_INBOUND_TAG,
-      email: emailTagFor(external_id),
-      uuid,
-    });
+  if (protocol !== 'vless_reality') return;
+  const added = [];
+  try {
+    for (const inbound of [{ tag: VLESS_INBOUND_TAG, flow: '' }, ...(VLESS_REALITY_INBOUND_TAG ? [{ tag: VLESS_REALITY_INBOUND_TAG, flow: 'xtls-rprx-vision' }] : [])]) {
+      try {
+        await grpcClient.addVlessUser({ ...inbound, email: emailTagFor(external_id), uuid });
+      } catch (err) {
+        if (!/already.*exist|duplicate/i.test(err.message)) throw err;
+        // Xray продолжал работать во время перезапуска node-agent.
+        continue;
+      }
+      added.push(inbound.tag);
+    }
+  } catch (err) {
+    for (const tag of added) await grpcClient.removeUser({ tag, email: emailTagFor(external_id) }).catch(() => {});
+    throw err;
   }
 }
-
 async function xrayRemoveClient({ protocol, external_id }) {
-  if (protocol === "vless_reality") {
-    await grpcClient.removeUser({
-      tag: VLESS_INBOUND_TAG,
-      email: emailTagFor(external_id),
-    });
+  db.revokeClient(external_id);
+  if (protocol === 'vless_reality') {
+    const results = await Promise.allSettled([VLESS_INBOUND_TAG, ...(VLESS_REALITY_INBOUND_TAG ? [VLESS_REALITY_INBOUND_TAG] : [])].map((tag) => grpcClient.removeUser({ tag, email: emailTagFor(external_id) })));
+    // Отсутствующий пользователь допустим; недоступный API — ошибка.
+    const failure = results.find((r) => r.status === 'rejected' && !/not found|not exist/i.test(r.reason.message));
+    if (failure) throw failure.reason;
   }
+  // Повторяем при сбое: DELETE не должен подтверждать оставшийся QUIC-туннель.
+  await kickClients(hysteriaStatsUrl, HYSTERIA_TRAFFIC_STATS_SECRET, [external_id]);
 }
 
 /**
@@ -174,13 +189,15 @@ app.get("/health", async (req, res) => {
     clients_count: db.clientsCount(),
     uptime_seconds: Math.floor((Date.now() - START_TIME) / 1000),
     xray_version: xrayOk ? "reachable" : "unreachable",
+    protocols: ["vless_ws", ...(VLESS_REALITY_INBOUND_TAG ? ["reality"] : []), ...(hysteriaStatsUrl ? ["hysteria2"] : [])],
   });
 });
 
 app.post("/internal/hysteria/auth", async (req, res) => {
+  if (!["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress)) return res.status(403).json({ ok: false });
   const { auth } = req.body || {};
 
-  if (!auth) {
+  if (typeof auth !== "string" || !auth) {
     logger.op("hysteria_auth", null, { ok: false, reason: "no_password" });
     return res.json({ ok: false });
   }
@@ -226,7 +243,15 @@ app.post("/clients", async (req, res) => {
 
   touch(external_id);
 
-  if (db.getClient(external_id)) {
+  const existing = db.getClient(external_id);
+  if (existing) {
+    if (existing.protocol === protocol && existing.uuid === uuid) {
+      if (existing.revoked) {
+        try { await xrayAddClient({ protocol, external_id, uuid }); }
+        catch { return res.status(503).json({ error: 'xray unavailable' }); }
+      }
+      db.updateLimits(external_id, traffic_limit_bytes ?? null, expires_at ?? null);
+    }
     return res.status(409).json({ error: "client already exists" });
   }
 
@@ -303,7 +328,8 @@ app.get("/clients/:external_id/stats", async (req, res) => {
 
   try {
     const stats = await grpcClient.getUserStats(emailTagFor(external_id));
-    res.json(stats);
+    const total = db.recordXrayTraffic(external_id, stats.bytes_uploaded, stats.bytes_downloaded);
+    res.json({ bytes_uploaded: total.bytes_uploaded, bytes_downloaded: total.bytes_downloaded });
   } catch (err) {
     logger.error("failed to query stats", { external_id, error: err.message });
     res.status(503).json({ error: "xray unavailable" });
@@ -329,7 +355,7 @@ app.get("/clients/:external_id/devices", async (req, res) => {
     // сервис мог просуммировать их той же логикой дедупликации по строке
     // — точность ниже, чем для VLESS, но достаточно для защиты от
     // расшаривания одной подписки.
-    const count = await getOnlineCount(HYSTERIA_TRAFFIC_STATS_URL, HYSTERIA_TRAFFIC_STATS_SECRET, external_id);
+    const count = await getOnlineCount(hysteriaStatsUrl, HYSTERIA_TRAFFIC_STATS_SECRET, external_id);
     const ips = Array.from({ length: count }, (_, i) => `hysteria2:${external_id}:${i}`);
     return res.json({ ips });
   }
@@ -396,7 +422,7 @@ process.on("uncaughtException", (err) => {
 
 startHysteriaTrafficPoller({
   db,
-  statsUrl: HYSTERIA_TRAFFIC_STATS_URL,
+  statsUrl: hysteriaStatsUrl,
   secret: HYSTERIA_TRAFFIC_STATS_SECRET,
   intervalMs: Number(HYSTERIA_TRAFFIC_POLL_INTERVAL_MS),
 });

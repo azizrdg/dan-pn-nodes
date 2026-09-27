@@ -47,14 +47,10 @@ function startMainSync({
     try {
       await xrayRemoveClient({ protocol: row.protocol, external_id: row.external_id });
     } catch (err) {
-      // Ошибка удаления может значить "пользователя в Xray уже нет" — тогда
-      // достаточно убрать строку из БД. Но если сам Xray недоступен, строку
-      // оставляем и повторим на следующем тике.
-      const xrayUp = await grpcClient.ping().catch(() => false);
-      if (!xrayUp) {
-        logger.warn("main-sync: Xray недоступен, удаление отложено", { external_id: row.external_id });
-        return false;
-      }
+      // При отказе Xray/QUIC API оставляем запись для повторного удаления.
+      // revokeClient уже запретил повторную аутентификацию.
+      logger.warn("main-sync: удаление отложено", { external_id: row.external_id, error: err.message });
+      return false;
     }
     db.deleteClient(row.external_id);
     return true;
@@ -141,7 +137,14 @@ function startMainSync({
           continue;
         }
         const row = localMap.get(id);
-        if (row && row.protocol === "vless_reality" && row.uuid === want.uuid) continue;
+        if (row && row.protocol === "vless_reality" && row.uuid === want.uuid) {
+          if (row.revoked) {
+            try { await xrayAddClient({ protocol: row.protocol, external_id: id, uuid: row.uuid }); }
+            catch (err) { logger.warn('main-sync: восстановление отложено', { external_id: id, error: err.message }); continue; }
+          }
+          db.updateLimits(id, want.traffic_limit_bytes != null ? Number(want.traffic_limit_bytes) : null, want.expires_at ?? null);
+          continue;
+        }
 
         if (row) {
           if (!(await removeLocal(row))) continue;

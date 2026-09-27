@@ -24,12 +24,16 @@ function startHysteriaTrafficPoller({ db, statsUrl, secret, intervalMs }) {
     return null;
   }
 
+  let running = false;
   async function poll() {
+    if (running) return;
+    running = true;
     try {
       const url = `${statsUrl.replace(/\/$/, "")}/traffic?clear=1`;
 
       const res = await fetch(url, {
-        headers: secret ? { Authorization: `Bearer ${secret}` } : {},
+        headers: secret ? { Authorization: secret } : {},
+      signal: AbortSignal.timeout(5000),
       });
 
       if (!res.ok) {
@@ -43,14 +47,26 @@ function startHysteriaTrafficPoller({ db, statsUrl, secret, intervalMs }) {
         const tx = Number(stat && stat.tx) || 0;
         const rx = Number(stat && stat.rx) || 0;
         if (tx === 0 && rx === 0) continue;
-        db.incrementTraffic(externalId, tx, rx);
+        const row = db.getClient(externalId);
+        if (!row) {
+          await kickClients(statsUrl, secret, [externalId]);
+          continue;
+        }
+        db.incrementTraffic(externalId, rx, tx);
+        const current = db.getClient(externalId);
+        if (isDenied(current)) await kickClients(statsUrl, secret, [externalId]);
       }
+      const denied = db.db.prepare(`SELECT external_id FROM clients WHERE revoked = 1
+        OR (expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now'))
+        OR (traffic_limit_bytes IS NOT NULL AND bytes_uploaded + bytes_downloaded >= traffic_limit_bytes)`).all();
+      if (denied.length) await kickClients(statsUrl, secret, denied.map((row) => row.external_id));
     } catch (err) {
       logger.warn("hysteria traffic poll failed", { error: err.message });
-    }
+    } finally { running = false; }
   }
 
   const timer = setInterval(poll, intervalMs);
+  poll();
   if (timer.unref) timer.unref();
 
   logger.info("hysteria traffic poller started", { statsUrl, intervalMs });
@@ -75,7 +91,8 @@ async function getOnlineCount(statsUrl, secret, externalId) {
   try {
     const url = `${statsUrl.replace(/\/$/, "")}/online`;
     const res = await fetch(url, {
-      headers: secret ? { Authorization: `Bearer ${secret}` } : {},
+      headers: secret ? { Authorization: secret } : {},
+      signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) return 0;
     const data = await res.json();
@@ -87,4 +104,16 @@ async function getOnlineCount(statsUrl, secret, externalId) {
   }
 }
 
-module.exports = { startHysteriaTrafficPoller, getOnlineCount };
+function isDenied(row) {
+  return !row || Boolean(row.revoked) || (row.expires_at && new Date(row.expires_at).getTime() <= Date.now()) ||
+    (row.traffic_limit_bytes != null && row.bytes_uploaded + row.bytes_downloaded >= row.traffic_limit_bytes);
+}
+async function kickClients(statsUrl, secret, ids) {
+  if (!statsUrl || !ids.length) return;
+  const res = await fetch(`${statsUrl.replace(/\/$/, '')}/kick`, {
+    method: 'POST', headers: { Authorization: secret || '', 'Content-Type': 'application/json' },
+    body: JSON.stringify(ids), signal: AbortSignal.timeout(5000)
+  });
+  if (!res.ok) throw new Error(`Hysteria kick: HTTP ${res.status}`);
+}
+module.exports = { startHysteriaTrafficPoller, getOnlineCount, kickClients, isDenied };

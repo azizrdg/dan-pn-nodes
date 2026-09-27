@@ -59,6 +59,13 @@ db.exec(`
   }
 })();
 
+// Xray отдаёт счётчики процесса. Храним дельты рядом с Hysteria2,
+// чтобы рестарт Xray и переключение нод не обнуляли оплаченный расход.
+for (const name of ['xray_up_seen', 'xray_down_seen', 'revoked']) {
+  if (!db.prepare('PRAGMA table_info(clients)').all().some((c) => c.name === name)) {
+    db.exec(`ALTER TABLE clients ADD COLUMN ${name} INTEGER NOT NULL DEFAULT 0`);
+  }
+}
 const stmts = {
   insert: db.prepare(`
     INSERT INTO clients (external_id, protocol, uuid, secret, email_tag, traffic_limit_bytes, expires_at, device_limit)
@@ -68,7 +75,7 @@ const stmts = {
   delete: db.prepare(`DELETE FROM clients WHERE external_id = ?`),
   count: db.prepare(`SELECT COUNT(*) AS c FROM clients`),
   findByHysteria2Password: db.prepare(`
-    SELECT * FROM clients WHERE protocol = 'hysteria2' AND secret = ?
+    SELECT * FROM clients WHERE revoked = 0 AND ((protocol = 'hysteria2' AND secret = ?) OR (protocol = 'vless_reality' AND uuid = ?))
   `),
   incrementTraffic: db.prepare(`
     UPDATE clients
@@ -84,6 +91,22 @@ module.exports = {
     stmts.insert.run({ device_limit: null, ...row });
     return stmts.get.get(row.external_id);
   },
+  revokeClient(externalId) {
+    db.prepare('UPDATE clients SET revoked = 1 WHERE external_id = ?').run(externalId);
+  },
+  updateLimits(externalId, trafficLimit, expiresAt) {
+    db.prepare('UPDATE clients SET traffic_limit_bytes = ?, expires_at = ?, revoked = 0 WHERE external_id = ?').run(trafficLimit, expiresAt, externalId);
+  },
+  recordXrayTraffic(externalId, up, down) {
+    return db.transaction(() => {
+      const row = stmts.get.get(externalId);
+      if (!row) return null;
+      const delta = (value, seen) => value >= seen ? value - seen : value;
+      stmts.incrementTraffic.run(delta(up, row.xray_up_seen), delta(down, row.xray_down_seen), externalId);
+      db.prepare('UPDATE clients SET xray_up_seen = ?, xray_down_seen = ? WHERE external_id = ?').run(up, down, externalId);
+      return stmts.get.get(externalId);
+    })();
+  },
   getClient(externalId) {
     return stmts.get.get(externalId);
   },
@@ -94,7 +117,7 @@ module.exports = {
     return stmts.count.get().c;
   },
   findByHysteria2Password(password) {
-    return stmts.findByHysteria2Password.get(password);
+    return stmts.findByHysteria2Password.get(password, password);
   },
   incrementTraffic(externalId, deltaUp, deltaDown) {
     return stmts.incrementTraffic.run(deltaUp, deltaDown, externalId);
